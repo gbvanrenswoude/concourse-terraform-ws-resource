@@ -1,0 +1,14 @@
+{"source":{
+  "folder": "cluster-code/terraform/main/products/eks",
+  "workspace": "cluster_316886154148_addtfws",
+  "assume_aws_role": "arn:aws:iam::316886154148:role/kube-admin",
+  "bucket": "kube-team-artifact-storage-master",
+  "workspace_key_prefix": "eks",
+  "encrypt": "true",
+  "kms_key_id": "arn:aws:kms:eu-west-1:316886154148:alias/kube-team-kms-key-master",
+  "dynamodb_table": "TerraformLockTable-master"
+},
+  "version":{
+    "release":"1"
+    }
+  }

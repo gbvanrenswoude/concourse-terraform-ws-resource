@@ -1,0 +1,61 @@
+#!/bin/bash
+
+set -ex
+
+# make sure to be in the resource dir
+cd "${1}"
+
+
+exec 3>&1 # make stdout available as fd 3 for the result
+exec 1>&2 # redirect all output to stderr for logging
+
+set +x
+
+payload=$(mktemp /tmp/resource-in.XXXXXX)
+
+cat > "${payload}" <&0
+
+timestamp="$(jq -n "{version:{timestamp:\"$(date +%s)\"}}")"
+OLDPWD=$(pwd)
+source /opt/resource/methods.sh
+
+echo "debug payload"
+echo ${payload}
+
+### Source Configuration
+TERRAFORM_FOLDER="$(jq -r '.source.folder' < "${payload}")"
+TERRAFORM_WORKSPACE="$(jq -r '.source.workspace // "default"' < "${payload}")"
+
+### Assumerole if needed
+assume_aws_role=$(jq -r '.source.assume_aws_role // ""' < $payload)
+aws_region=$(jq -r '.source.aws_region // "eu-west-1"' < $payload)
+if [ ! -z "$assume_aws_role" ]; then
+  echo "Assuming aws role with arn $assume_aws_role"
+  export temp_credentials=$(aws sts assume-role --role-arn $assume_aws_role --role-session-name concourse-helm-resource-session)
+  export AWS_ACCESS_KEY_ID=$(echo ${temp_credentials} | jq -r '.Credentials.AccessKeyId') AWS_SESSION_TOKEN=$(echo ${temp_credentials} | jq -r '.Credentials.SessionToken') AWS_SECRET_ACCESS_KEY=$(echo ${temp_credentials} | jq -r ' .Credentials.SecretAccessKey') AWS_DEFAULT_REGION=$aws_region
+fi
+
+generate_tf_statefile
+
+terraform init \
+  -input=false -plugin-dir=/usr/lib/custom-terraform-plugins
+
+if [[ $(terraform workspace list | grep "\s${TERRAFORM_WORKSPACE}$") ]]; then
+  terraform workspace select ${TERRAFORM_WORKSPACE}
+else
+  echo "Creating new workspace... Be aware, this might be the result of misconfiguration in the pipeline"
+  terraform workspace new ${TERRAFORM_WORKSPACE}
+fi
+
+serial="$(terraform state pull | jq .serial )"
+
+if [ -z "$serial" ]; then
+  echo "No remote state found to track yet.. Do a deploy or provide the correct workspace and Concourse will start tracking it."
+  exit 1
+else
+  echo "Found serial:"
+  echo $serial
+fi
+
+result="$(jq -n "[{ \"release\": \"$serial\" }]")"
+echo "$result" | jq -s add  >&3

@@ -1,0 +1,148 @@
+#!/bin/bash
+
+set -ex
+
+# make sure to be in the resource dir
+cd "${1}"
+
+exec 3>&1 # make stdout available as fd 3 for the result
+exec 1>&2 # redirect all output to stderr for logging
+set +x
+
+payload=$(mktemp /tmp/resource-in.XXXXXX)
+
+cat > "${payload}" <&0
+
+timestamp="$(jq -n "{version:{timestamp:\"$(date +%s)\"}}")"
+OLDPWD=$(pwd)
+source /opt/resource/methods.sh
+
+### Source Configuration
+TERRAFORM_FOLDER="$(jq -r '.source.folder' < "${payload}")"
+TERRAFORM_WORKSPACE="$(jq -r '.source.workspace // "default"' < "${payload}")"
+
+### Param Configuration
+TERRAFORM_BEHAVIOR="$(jq -r '.params.behavior // "apply"' < "${payload}")"
+CHECKPOINT_DISABLE="$(jq -r '.params.behavior // "1"' < "${payload}")"
+TF_LOG="$(jq -r '.params.loglevel // "INFO"' < "${payload}")"
+TERRAFORM_OUTPUT="$(jq -r '.params.print_outputs // "false"' < "${payload}")"
+VARS="$(jq -r '.params.vars // ""' < "${payload}")"
+VAR_FILES="$(jq -r '.params.varfiles // ""' < "${payload}")"
+TERRAFORM_TARGETS="$(jq -r '.params.targets // ""' < "${payload}")"
+
+echo "debug payload"
+echo ${payload}
+echo "debug vars"
+env
+
+
+### Assumerole if needed
+assume_aws_role=$(jq -r '.source.assume_aws_role // ""' < $payload)
+aws_region=$(jq -r '.source.aws_region // "eu-west-1"' < $payload)
+if [ ! -z "$assume_aws_role" ]; then
+  echo "Assuming aws role with arn $assume_aws_role"
+  export temp_credentials=$(aws sts assume-role --role-arn $assume_aws_role --role-session-name concourse-helm-resource-session)
+  export AWS_ACCESS_KEY_ID=$(echo ${temp_credentials} | jq -r '.Credentials.AccessKeyId') AWS_SESSION_TOKEN=$(echo ${temp_credentials} | jq -r '.Credentials.SessionToken') AWS_SECRET_ACCESS_KEY=$(echo ${temp_credentials} | jq -r ' .Credentials.SecretAccessKey') AWS_DEFAULT_REGION=$aws_region
+fi
+
+### Set logic
+if [[ "$CHECKPOINT_DISABLE" == "false" ]]; then
+  CHECKPOINT_DISABLE=""
+fi
+
+if [ ! -z "$VARS" ]; then
+  echo "Parsing VARS"
+  echo "$VARS" > vars.json
+  cat vars.json
+
+  echo "Done checking, now parsing vars and wrapping in Terraform command..."
+  /opt/resource/parsetfvars2.py > bkvars.txt
+
+  CMV=$(cat bkvars.txt| tr '\n' ' ')
+
+  echo "Set up the following Terraform vars..."
+  echo $CMV
+fi
+
+if [ ! -z "$TERRAFORM_TARGETS" ]; then
+  echo "Parsing TERRAFORM_TARGETS"
+  echo "$TERRAFORM_TARGETS" > list.json
+  /opt/resource/parsejsonlist.py > targets.sh
+  TARGETS=$(cat targets.sh)
+  echo "Set up the following Terraform targets..."
+  echo $TARGETS
+fi
+
+if [ ! -z "$VAR_FILES" ]; then
+  echo "Checking the variable files..."
+  echo "$VAR_FILES" > varfiles.json
+  FILESET=$(/opt/resource/checkvarfiles.py)
+  echo "fileset"
+  echo $FILESET
+  for file in $FILESET; do
+    if [[ ! -f "$file" ]]
+    then
+      echo "TFvar file not found! : "
+      echo $file
+      echo "Continuing..."
+    else
+      continue
+    fi
+  done
+  echo "Done checking, now parsing VAR_FILES paths and wrapping in Terraform command..."
+  /opt/resource/parsevarfiles.py > varfiles.sh
+  VAR_FILES=$(cat varfiles.sh)
+  echo "Set up the following Terraform var files..."
+  echo $VAR_FILES
+fi
+
+echo "Changing working dir to the Terraform root folder. This is needed for workspace semantics..."
+cd "${TERRAFORM_FOLDER}"
+
+echo "Downloading modules..."
+terraform get
+
+# During init, the configuration is searched for both direct and indirect references to providers, and the plugins for the providers are retrieved from the plugin repository.
+terraform init \
+  -input=false -plugin-dir=/usr/lib/custom-terraform-plugins
+
+# Switch and work in the proper workspace
+# We want to ensure creation of a new workspace if none existed before
+if [[ $(terraform workspace list | grep "\s${TERRAFORM_WORKSPACE}$") ]]; then
+  echo "Selecting the workspace..."
+  terraform workspace select ${TERRAFORM_WORKSPACE}
+else
+  echo "Creating new workspace..."
+  terraform workspace new ${TERRAFORM_WORKSPACE}
+fi
+
+# If condition here because of the difference in supported flags between tf commands.
+if [ ${TERRAFORM_BEHAVIOR} = "destroy" ]; then
+  echo "terraform ${TERRAFORM_BEHAVIOR} ${TARGETS} ${VAR_FILES} ${CMV} -refresh=true -input=false -force=true" > destroy.sh
+  chmod +x ./destroy.sh
+  ./destroy.sh
+  # Delete workspace if destroy was not requested only for specific target
+  if [ -z "${TERRAFORM_TARGETS}" ]
+  then
+    echo "Deleting the workspace..."
+    terraform workspace select default
+    terraform workspace delete ${TERRAFORM_WORKSPACE}
+  fi
+elif [ ${TERRAFORM_BEHAVIOR} = "taint" ]; then
+  terraform ${TERRAFORM_BEHAVIOR} ${TERRAFORM_TARGETS}
+else
+  echo "terraform ${TERRAFORM_BEHAVIOR} ${TARGETS} ${VAR_FILES} ${CMV} -refresh=true -input=false -auto-approve=true" > apply.sh
+  chmod +x apply.sh
+  ./apply.sh
+  # Give back the terraform output
+fi
+
+# If the TERRAFORM_OUTPUT is true, export the output
+if [[ "$TERRAFORM_OUTPUT" == "true" ]]; then
+  terraform output
+fi
+
+serial="$(terraform state pull | jq .serial )"
+
+result="$(jq -n "{version:{release:\"$serial\"}, metadata: [{name: \"release\", value: \"$serial\"},{name: \"workspace\", value: \"$TERRAFORM_WORKSPACE\"},{name: \"root\", value: \"$TERRAFORM_FOLDER\"}]}")"
+echo "$result" | jq -s add  >&3
